@@ -1,0 +1,68 @@
+emulate -L zsh
+setopt no_unset pipe_fail 2>/dev/null
+
+local shell_pid=$1 histcmd=$2 start_epoch=$3 cwd=$4
+local cmd
+cmd=$(cat)  # full command string from stdin
+
+sleep "${REAP[THRESHOLD]:-5}"
+
+# Read the shell's controlling tty's foreground pgrp and the shell's own pgid.
+local tpgid shell_pgid
+tpgid=$(ps -o tpgid= -p "$shell_pid" 2>/dev/null) || return
+shell_pgid=$(ps -o pgid= -p "$shell_pid" 2>/dev/null) || return
+tpgid=${tpgid//[[:space:]]/}
+shell_pgid=${shell_pgid//[[:space:]]/}
+
+[[ -z $tpgid ]] && return
+(( tpgid == shell_pgid )) && return  # shell is at its prompt, nothing to track
+
+# Find the foreground child. Prefer the one whose PPID is the shell —
+# in a pipeline only the first stage is a direct child of the shell.
+local -a pgrp_pids
+pgrp_pids=( ${(f)"$(pgrep -g "$tpgid" 2>/dev/null)"} )
+(( $#pgrp_pids )) || return
+
+local child_pid="" p ppid
+for p in $pgrp_pids; do
+  ppid=$(ps -o ppid= -p "$p" 2>/dev/null)
+  ppid=${ppid//[[:space:]]/}
+  if [[ $ppid == $shell_pid ]]; then
+    child_pid=$p
+    break
+  fi
+done
+[[ -z $child_pid ]] && child_pid=$pgrp_pids[1]
+
+local shell_tty
+shell_tty=$(ps -o tty= -p "$shell_pid" 2>/dev/null)
+shell_tty=${shell_tty//[[:space:]]/}
+
+local entry_id
+entry_id=$(printf '%x-%x' "$shell_pid" "$histcmd")
+
+local state_dir="${REAP[STATE_DIR]:-${XDG_STATE_HOME:-$HOME/.local/state}/zsh-reap}"
+local entry_file=$state_dir/jobs/$entry_id
+local tmp=${entry_file}.tmp.$RANDOM$RANDOM
+
+# printf %q produces a single-line shell-quoted form that the CLI/trap
+# recover with eval. Handles newlines, spaces, quotes, $-expansion, and
+# also values like "??" that would otherwise glob-expand at eval time.
+local cmd_q cwd_q tty_q
+cmd_q=$(printf '%q' "$cmd")
+cwd_q=$(printf '%q' "$cwd")
+tty_q=$(printf '%q' "$shell_tty")
+
+{
+  print -r -- "entry_id=$entry_id"
+  print -r -- "shell_pid=$shell_pid"
+  print -r -- "shell_tty=$tty_q"
+  print -r -- "child_pid=$child_pid"
+  print -r -- "child_pgid=$tpgid"
+  print -r -- "command=$cmd_q"
+  print -r -- "cwd=$cwd_q"
+  print -r -- "start_epoch=$start_epoch"
+} > "$tmp" 2>/dev/null || { rm -f "$tmp"; return }
+
+chmod 0600 "$tmp"
+mv -f "$tmp" "$entry_file"

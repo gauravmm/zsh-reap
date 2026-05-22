@@ -1,0 +1,9 @@
+emulate -L zsh
+
+# After every command, remove any registry entry for this shell. If the
+# watcher promoted the candidate to a registered entry, it goes here. If
+# the command exited before the threshold, the glob matches nothing
+# (silent via the (N) qualifier).
+local prefix
+prefix=$(printf '%x' $$)
+rm -f "${REAP[STATE_DIR]}/jobs/${prefix}-"*(N)

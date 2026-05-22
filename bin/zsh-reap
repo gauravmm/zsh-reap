@@ -1,0 +1,202 @@
+#!/usr/bin/env zsh
+# zsh-reap CLI — list / show / kill / restart / forget tracked jobs.
+
+emulate -L zsh
+setopt err_return no_unset pipe_fail extended_glob
+
+zmodload zsh/datetime  # provides $EPOCHSECONDS
+
+typeset -g STATE_DIR="${ZSH_REAP_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/zsh-reap}"
+typeset -g JOBS_DIR="$STATE_DIR/jobs"
+
+usage() {
+  cat <<'EOF'
+usage: zsh-reap <command> [args]
+
+commands:
+  list                  show all tracked jobs (TSV)
+  show <id>             dump full metadata for one entry
+  kill <id>             SIGTERM the job; escalate to SIGKILL after 5s
+  restart <id> [--wait] tell the originating shell to restart the job
+  forget <id>           remove the entry without killing anything
+
+env:
+  ZSH_REAP_STATE_DIR    state dir (default $XDG_STATE_HOME/zsh-reap)
+EOF
+}
+
+die() { print -u2 -r -- "zsh-reap: $*"; exit 1 }
+
+is_alive() { kill -0 "$1" 2>/dev/null }
+
+# Read one field from an entry file. String fields are printf-%q-quoted;
+# eval recovers the original. Returns nonzero if the field isn't present.
+read_field() {
+  local file=$1 wanted=$2 key value
+  while IFS='=' read -r key value; do
+    if [[ $key == $wanted ]]; then
+      case $key in
+        command|cwd|shell_tty)
+          eval "printf '%s' $value" ;;
+        *)
+          printf '%s' "$value" ;;
+      esac
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+# Lazy GC: remove the entry if either child or shell is gone.
+gc_one() {
+  local file=$1 cpid spid
+  cpid=$(read_field "$file" child_pid 2>/dev/null) || { rm -f "$file"; return 1 }
+  spid=$(read_field "$file" shell_pid 2>/dev/null) || { rm -f "$file"; return 1 }
+  if ! is_alive "$cpid" || ! is_alive "$spid"; then
+    rm -f "$file"
+    return 1
+  fi
+  return 0
+}
+
+resolve_entry() {
+  local id=$1
+  [[ -n $id ]] || die "missing entry id"
+  local f=$JOBS_DIR/$id
+  [[ -f $f ]] || die "no such entry: $id"
+  printf '%s' "$f"
+}
+
+format_uptime() {
+  local s=$1
+  printf '%d:%02d:%02d' $(( s / 3600 )) $(( (s / 60) % 60 )) $(( s % 60 ))
+}
+
+cmd_list() {
+  printf 'ID\tPID\tSHELL\tCWD\tUPTIME\tCOMMAND\n'
+  local f
+  for f in "$JOBS_DIR"/*(N); do
+    gc_one "$f" || continue
+    local id pid tty cwd start cmd uptime
+    id=$(read_field "$f" entry_id)
+    pid=$(read_field "$f" child_pid)
+    tty=$(read_field "$f" shell_tty)
+    cwd=$(read_field "$f" cwd)
+    start=$(read_field "$f" start_epoch)
+    cmd=$(read_field "$f" command)
+    uptime=$(( EPOCHSECONDS - start ))
+    cmd=${cmd//$'\t'/ }
+    cmd=${cmd//$'\n'/ }
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$id" "$pid" "$tty" "$cwd" "$(format_uptime $uptime)" "$cmd"
+  done
+}
+
+cmd_show() {
+  local f
+  f=$(resolve_entry "${1:-}")
+  cat "$f"
+}
+
+cmd_kill() {
+  local f pgid cpid i
+  f=$(resolve_entry "${1:-}")
+  pgid=$(read_field "$f" child_pgid)
+  cpid=$(read_field "$f" child_pid)
+  [[ -n $pgid && -n $cpid ]] || die "entry missing child_pid/child_pgid"
+
+  if ! is_alive "$cpid"; then
+    rm -f "$f"
+    return 0
+  fi
+
+  kill -TERM -"$pgid" 2>/dev/null || true
+
+  for i in {1..50}; do
+    sleep 0.1
+    if ! is_alive "$cpid"; then
+      rm -f "$f"
+      return 0
+    fi
+  done
+
+  kill -KILL -"$pgid" 2>/dev/null || true
+
+  for i in {1..20}; do
+    sleep 0.1
+    if ! is_alive "$cpid"; then
+      rm -f "$f"
+      return 0
+    fi
+  done
+
+  die "child $cpid still alive after SIGKILL to pgrp $pgid"
+}
+
+cmd_restart() {
+  local id=${1:-}
+  shift || true
+  local wait=0
+  while (( $# )); do
+    case $1 in
+      --wait) wait=1 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+    shift
+  done
+
+  local f spid old_cpid
+  f=$(resolve_entry "$id")
+  spid=$(read_field "$f" shell_pid)
+  old_cpid=$(read_field "$f" child_pid)
+
+  if ! is_alive "$spid"; then
+    rm -f "$f"
+    die "shell $spid is gone; entry removed"
+  fi
+
+  kill -USR1 "$spid" || die "failed to signal shell $spid"
+
+  (( wait )) || return 0
+
+  # Poll for the entry to come back with a fresh child_pid (the watcher
+  # spawned by the trap registers the new run after THRESHOLD seconds).
+  local timeout_iters=200  # ~20s; > default threshold + slack
+  local i new_cpid
+  for i in {1..$timeout_iters}; do
+    sleep 0.1
+    [[ -f $f ]] || continue
+    new_cpid=$(read_field "$f" child_pid 2>/dev/null) || continue
+    if [[ -n $new_cpid && $new_cpid != $old_cpid ]]; then
+      return 0
+    fi
+  done
+  die "timeout waiting for restart"
+}
+
+cmd_forget() {
+  local f
+  f=$(resolve_entry "${1:-}")
+  rm -f "$f"
+}
+
+main() {
+  local sub=${1:-}
+  shift 2>/dev/null || true
+  case $sub in
+    -h|--help|help|"") usage; return 0 ;;
+  esac
+
+  [[ -d $JOBS_DIR ]] || die "state dir $JOBS_DIR does not exist; is the plugin loaded?"
+
+  case $sub in
+    list)    cmd_list "$@" ;;
+    show)    cmd_show "$@" ;;
+    kill)    cmd_kill "$@" ;;
+    restart) cmd_restart "$@" ;;
+    forget)  cmd_forget "$@" ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

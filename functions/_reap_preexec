@@ -1,0 +1,6 @@
+emulate -L zsh
+
+# Spawn a detached watcher. The double-fork (( ... & ) &!) makes the watcher
+# a child of init, off the shell's job table. The command string is piped
+# via stdin to dodge shell-quoting on multi-line input.
+( _reap_watcher "$$" "$HISTCMD" "$EPOCHSECONDS" "$PWD" <<<"$1" & ) &!
