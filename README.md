@@ -42,6 +42,12 @@ re-executes it. No user interaction required.
 The CLI `zsh-reap` is added to your `$PATH` by the plugin. The state dir
 defaults to `${XDG_STATE_HOME:-~/.local/state}/zsh-reap`.
 
+If you'd rather hand the install off to your coding agent, see
+[`AGENT_INSTALL.md`](AGENT_INSTALL.md) — it contains a self-contained
+prompt you can paste into a chat. The agent also gets a
+[Claude Code skill](skills/zsh-reap/SKILL.md) describing when to use
+the tool and what *not* to use it for.
+
 ## Use
 
 ```
