@@ -34,6 +34,19 @@ for p in $pgrp_pids; do
 done
 [[ -z $child_pid ]] && child_pid=$pgrp_pids[1]
 
+# Sanity check: the candidate child must be at least as old as we are.
+# We were forked at preexec, when the shell forked the command's child;
+# if the child is significantly younger, the original command finished
+# and a newer command (with the same tpgid path back to this shell)
+# took its place during our sleep. Writing in that case would produce
+# a Frankenstein entry — old captured command, current child pid.
+local child_etimes
+child_etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null)
+child_etimes=${child_etimes//[[:space:]]/}
+[[ -z $child_etimes ]] && return
+local watcher_age=$(( EPOCHSECONDS - start_epoch ))
+(( child_etimes + 2 < watcher_age )) && return
+
 local shell_tty
 shell_tty=$(ps -o tty= -p "$shell_pid" 2>/dev/null)
 shell_tty=${shell_tty//[[:space:]]/}

@@ -172,7 +172,16 @@ and the command string on stdin. It:
    treats the youngest one with `PPID == shell_pid` as `child_pid`. (For
    pipelines, all children share `tpgid`; we record the pgid as the
    primary identifier and the first child as `child_pid`.)
-5. Writes the entry to `$STATE/jobs/$(printf '%x-%x' $shell_pid $histcmd)`.
+5. Verifies the candidate child is at least as old as the watcher
+   (`ps -o etimes= -p $child_pid` ≳ `EPOCHSECONDS - start_epoch`). If
+   the child is significantly younger, the original command finished
+   during our sleep and a new one took its place; writing would
+   produce a stale-command / current-pid Frankenstein entry. Bail
+   instead. This race is most easily hit when the user's first command
+   ends in `exec zsh` — the shell PID survives, so a watcher from
+   before the exec would otherwise attribute the post-exec foreground
+   to the pre-exec command string.
+6. Writes the entry to `$STATE/jobs/$(printf '%x-%x' $shell_pid $histcmd)`.
 
 ### 2.4 Why this approach
 
