@@ -7,7 +7,7 @@ is in [`spec/SPEC.md`](spec/SPEC.md) — treat that as the source of truth.
 ## Layout
 
 - `zsh-reap.plugin.zsh` — entry script. Sets up the `REAP` hash,
-  registers preexec/precmd/zshexit hooks, defines `TRAPUSR1`.
+  registers preexec/precmd/zshexit hooks. No `TRAPUSR1` (see spec §5.1).
 - `functions/_reap_*` — autoloaded function files (one function per
   file, no extension, per the Zsh Plugin Standard).
 - `bin/zsh-reap` — the external CLI (executable zsh script).
@@ -19,10 +19,13 @@ is in [`spec/SPEC.md`](spec/SPEC.md) — treat that as the source of truth.
 preexec    → spawns detached watcher (double-fork, no I/O)
 watcher    → sleeps THRESHOLD seconds, then writes $STATE/jobs/<id>
              if the shell is still in a foreground command
-precmd     → rm -f $STATE/jobs/<this-shell>-*  (always; harmless if absent)
-zshexit    → same cleanup as precmd
-TRAPUSR1   → find this shell's entry, kill old child, eval the command
-             (the CLI's `restart` is just `kill -USR1 <shell_pid>`)
+precmd     → if $STATE/pending/$$ exists, consume it: cd, _reap_preexec,
+             eval the staged command (loops in case more arrive); then
+             rm -f $STATE/jobs/<this-shell>-*  (harmless if absent)
+zshexit    → cleans both jobs/<this-shell>-* and pending/$$
+CLI restart → writes $STATE/pending/<shell_pid> with cmd+cwd, then
+             kills the foreground child (TERM → 5s poll → KILL). The
+             kill is what wakes the shell's wait() so precmd can run.
 ```
 
 ## Conventions (please respect)
@@ -91,4 +94,8 @@ exercise the full path. CLI subcommands (`list`, `show`, `forget`, `kill`,
 - For changes to the on-disk format, update the schema table in §3.2
   and the field list in `_reap_watcher`.
 - For changes to the restart protocol, update §5.1 (including the
-  vertical diagram) and `_reap_trapusr1`.
+  vertical diagram), `_reap_precmd`'s pending-loop, and the CLI's
+  `cmd_restart`.
+- A `ZSH_REAP_DEBUG=1` env var (set in the user's interactive shell)
+  appends timestamped lines to `$STATE/debug.log` from `_reap_precmd`.
+  Useful for diagnosing restart-timing issues; cheap when unset.

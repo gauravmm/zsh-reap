@@ -1,7 +1,9 @@
 emulate -L zsh
 
-# When the shell exits, remove all of its registry entries — the spec
-# guarantees same-shell restart only, so there's no value keeping them.
+# When the shell exits, remove all of its registry entries and any
+# pending restart — the spec guarantees same-shell restart only, so
+# there's no value keeping them.
 local prefix
 prefix=$(printf '%x' $$)
 rm -f "${REAP[STATE_DIR]}/jobs/${prefix}-"*(N)
+rm -f "${REAP[STATE_DIR]}/pending/$$"

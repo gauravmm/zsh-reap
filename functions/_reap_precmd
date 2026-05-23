@@ -1,9 +1,55 @@
 emulate -L zsh
 
-# After every command, remove any registry entry for this shell. If the
-# watcher promoted the candidate to a registered entry, it goes here. If
-# the command exited before the threshold, the glob matches nothing
-# (silent via the (N) qualifier).
+# After every command, two things to do:
+#   1. If the CLI staged a restart (pending/$$), run it now. The CLI
+#      kills the foreground child to wake the shell's wait(); we land
+#      here on the way to the prompt, see the pending file, and eval
+#      the command in this very precmd. The eval blocks like a normal
+#      foreground job; when it exits we loop back in case a further
+#      restart was queued.
+#   2. Otherwise (or after restarting), remove any leftover registry
+#      entry for this shell — the watcher may have promoted one before
+#      the command exited.
+
 local prefix
 prefix=$(printf '%x' $$)
-rm -f "${REAP[STATE_DIR]}/jobs/${prefix}-"*(N)
+local state=${REAP[STATE_DIR]}
+local pending=$state/pending/$$
+
+while [[ -f $pending ]]; do
+  local key value cmd_q="" cwd_q=""
+  while IFS='=' read -r key value; do
+    case $key in
+      command) cmd_q=$value ;;
+      cwd) cwd_q=$value ;;
+    esac
+  done < "$pending"
+  rm -f "$pending"
+
+  local cmd cwd
+  eval "cmd=$cmd_q"
+  eval "cwd=$cwd_q"
+  [[ -z $cmd ]] && continue
+
+  if [[ -n ${ZSH_REAP_DEBUG:-} ]]; then
+    zmodload zsh/datetime 2>/dev/null
+    print -r -- "${EPOCHREALTIME} pid=$$ precmd restart cmd=${cmd:0:60}" \
+      >> "$state/debug.log"
+  fi
+
+  rm -f "$state/jobs/${prefix}-"*(N)
+  [[ -n $cwd ]] && cd -- "$cwd" 2>/dev/null
+
+  _reap_preexec "$cmd"
+  eval -- "$cmd"
+done
+
+if [[ -n ${ZSH_REAP_DEBUG:-} ]]; then
+  zmodload zsh/datetime 2>/dev/null
+  local -a _existing
+  _existing=( "$state/jobs/${prefix}-"*(N) )
+  print -r -- "${EPOCHREALTIME} pid=$$ precmd cleanup entries=${#_existing}" \
+    >> "$state/debug.log"
+fi
+
+rm -f "$state/jobs/${prefix}-"*(N)

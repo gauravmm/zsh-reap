@@ -65,13 +65,15 @@ A `preexec` hook spawns a detached watcher with the command, cwd, and
 your shell's controlling-tty foreground process group. If the shell is
 still blocked on a foreground job, the watcher records an entry under
 `$XDG_STATE_HOME/zsh-reap/jobs/<id>`. When you (or an agent) run
-`zsh-reap restart <id>`, the CLI sends `SIGUSR1` to your shell; a
-`TRAPUSR1` handler finds the entry, kills the foreground job, and
-`eval`s the recorded command in-place.
+`zsh-reap restart <id>`, the CLI stages the command in
+`$XDG_STATE_HOME/zsh-reap/pending/<shell_pid>` and kills the
+foreground job; the kill wakes your shell's `wait()`, your shell's
+`precmd` notices the pending file, and `eval`s the recorded command
+in-place.
 
 The full design — including why some obvious-looking alternatives
-(`print -z`, pending files, env snapshots, detach-restart) are
-explicitly out of scope — is in [`spec/SPEC.md`](spec/SPEC.md).
+(`print -z`, `TRAPUSR1`, env snapshots, detach-restart) are explicitly
+out of scope or were tried and abandoned — is in [`spec/SPEC.md`](spec/SPEC.md).
 
 ## Configuration
 

@@ -98,38 +98,35 @@ cmd_show() {
   cat "$f"
 }
 
+# SIGTERM the pgrp, poll up to 5s, then SIGKILL and poll another 2s.
+# Returns 0 if the child died, nonzero if it survived SIGKILL.
+kill_pgrp_gracefully() {
+  local pgid=$1 cpid=$2 i
+  is_alive "$cpid" || return 0
+  kill -TERM -"$pgid" 2>/dev/null || true
+  for i in {1..50}; do
+    sleep 0.1
+    is_alive "$cpid" || return 0
+  done
+  kill -KILL -"$pgid" 2>/dev/null || true
+  for i in {1..20}; do
+    sleep 0.1
+    is_alive "$cpid" || return 0
+  done
+  return 1
+}
+
 cmd_kill() {
-  local f pgid cpid i
+  local f pgid cpid
   f=$(resolve_entry "${1:-}")
   pgid=$(read_field "$f" child_pgid)
   cpid=$(read_field "$f" child_pid)
   [[ -n $pgid && -n $cpid ]] || die "entry missing child_pid/child_pgid"
 
-  if ! is_alive "$cpid"; then
+  if kill_pgrp_gracefully "$pgid" "$cpid"; then
     rm -f "$f"
     return 0
   fi
-
-  kill -TERM -"$pgid" 2>/dev/null || true
-
-  for i in {1..50}; do
-    sleep 0.1
-    if ! is_alive "$cpid"; then
-      rm -f "$f"
-      return 0
-    fi
-  done
-
-  kill -KILL -"$pgid" 2>/dev/null || true
-
-  for i in {1..20}; do
-    sleep 0.1
-    if ! is_alive "$cpid"; then
-      rm -f "$f"
-      return 0
-    fi
-  done
-
   die "child $cpid still alive after SIGKILL to pgrp $pgid"
 }
 
@@ -145,31 +142,61 @@ cmd_restart() {
     shift
   done
 
-  local f spid old_cpid
+  local f spid old_cpid old_pgid cmd cwd
   f=$(resolve_entry "$id")
   spid=$(read_field "$f" shell_pid)
   old_cpid=$(read_field "$f" child_pid)
+  old_pgid=$(read_field "$f" child_pgid)
+  cmd=$(read_field "$f" command)
+  cwd=$(read_field "$f" cwd)
 
   if ! is_alive "$spid"; then
     rm -f "$f"
     die "shell $spid is gone; entry removed"
   fi
 
-  kill -USR1 "$spid" || die "failed to signal shell $spid"
+  # Stage the command in pending/<shell_pid> for _reap_precmd to consume.
+  # We don't use TRAPUSR1: function-form zsh traps defer to safe points
+  # between commands, can be lost across nested traps, and race the
+  # precmd that deletes the entry. precmd always fires after the
+  # foreground child dies, so wakeup-by-kill plus pending-file is
+  # deterministic.
+  local pending_dir=$STATE_DIR/pending
+  mkdir -p "$pending_dir" && chmod 0700 "$pending_dir" 2>/dev/null
+  local pending=$pending_dir/$spid
+  local tmp=$pending.tmp.$$
+  {
+    printf 'command=%s\n' "$(printf '%q' "$cmd")"
+    printf 'cwd=%s\n'     "$(printf '%q' "$cwd")"
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$pending"
+
+  # Kill the child to wake the shell's wait(); precmd then sees pending.
+  if [[ -n $old_pgid && -n $old_cpid ]]; then
+    if ! kill_pgrp_gracefully "$old_pgid" "$old_cpid"; then
+      rm -f "$pending"
+      die "child $old_cpid still alive after SIGKILL to pgrp $old_pgid"
+    fi
+  fi
 
   (( wait )) || return 0
 
-  # Poll for the entry to come back with a fresh child_pid (the watcher
-  # spawned by the trap registers the new run after THRESHOLD seconds).
+  # Poll for any entry from this shell whose child_pid != the old one.
+  # The new entry's id is not predictable: HISTCMD advances between the
+  # killed command and the restart eval, so the new file is a sibling
+  # of $f, not $f itself.
+  local prefix=$(printf '%x' "$spid")
   local timeout_iters=200  # ~20s; > default threshold + slack
-  local i new_cpid
+  local i nf new_cpid
   for i in {1..$timeout_iters}; do
     sleep 0.1
-    [[ -f $f ]] || continue
-    new_cpid=$(read_field "$f" child_pid 2>/dev/null) || continue
-    if [[ -n $new_cpid && $new_cpid != $old_cpid ]]; then
-      return 0
-    fi
+    for nf in "$JOBS_DIR/${prefix}-"*(N); do
+      new_cpid=$(read_field "$nf" child_pid 2>/dev/null) || continue
+      if [[ -n $new_cpid && $new_cpid != $old_cpid ]]; then
+        return 0
+      fi
+    done
   done
   die "timeout waiting for restart"
 }

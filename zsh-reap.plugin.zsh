@@ -20,16 +20,18 @@ REAP[THRESHOLD]="${ZSH_REAP_THRESHOLD:-5}"
 zmodload zsh/datetime  # $EPOCHSECONDS
 
 autoload -Uz add-zsh-hook
-autoload -Uz _reap_preexec _reap_precmd _reap_zshexit _reap_trapusr1 _reap_watcher
+autoload -Uz _reap_preexec _reap_precmd _reap_zshexit _reap_watcher
 
 [[ -o interactive ]] || return 0
 (( ZSH_SUBSHELL == 0 )) || return 0
 
-mkdir -p "${REAP[STATE_DIR]}/jobs"
+mkdir -p "${REAP[STATE_DIR]}/jobs" "${REAP[STATE_DIR]}/pending"
 chmod 0700 "${REAP[STATE_DIR]}"
+
+# A stale pending file for this PID (PID reuse across reboots) would
+# trigger an unwanted restart on the next prompt — drop it on load.
+rm -f "${REAP[STATE_DIR]}/pending/$$"
 
 add-zsh-hook preexec _reap_preexec
 add-zsh-hook precmd  _reap_precmd
 add-zsh-hook zshexit _reap_zshexit
-
-TRAPUSR1() { _reap_trapusr1 }

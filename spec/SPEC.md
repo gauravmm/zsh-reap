@@ -41,9 +41,8 @@ zsh-reap/
 ├── zsh-reap.plugin.zsh        # entry script, sourced by every supported manager
 ├── functions/                 # autoloaded, one function per file (no extension)
 │   ├── _reap_preexec
-│   ├── _reap_precmd
+│   ├── _reap_precmd          # also handles staged restarts (see §5)
 │   ├── _reap_zshexit
-│   ├── _reap_trapusr1
 │   └── _reap_watcher
 ├── bin/
 │   └── zsh-reap               # the external CLI (zsh script)
@@ -77,22 +76,23 @@ REAP[THRESHOLD]="${ZSH_REAP_THRESHOLD:-5}"   # seconds
 [[ $PMSPEC != *b* ]] && path+=( "${0:h}/bin" )
 
 autoload -Uz add-zsh-hook
-autoload -Uz _reap_preexec _reap_precmd _reap_zshexit \
-             _reap_trapusr1 _reap_watcher
+autoload -Uz _reap_preexec _reap_precmd _reap_zshexit _reap_watcher
 
 # Only run in interactive top-level shells
 [[ -o interactive ]] || return 0
 (( ZSH_SUBSHELL == 0 )) || return 0
 
-mkdir -p "${REAP[STATE_DIR]}/jobs"
+mkdir -p "${REAP[STATE_DIR]}/jobs" "${REAP[STATE_DIR]}/pending"
 chmod 0700 "${REAP[STATE_DIR]}"
+rm -f "${REAP[STATE_DIR]}/pending/$$"   # PID-reuse safety
 
 add-zsh-hook preexec _reap_preexec
 add-zsh-hook precmd  _reap_precmd
 add-zsh-hook zshexit _reap_zshexit
-
-TRAPUSR1() { _reap_trapusr1 }
 ```
+
+No `TRAPUSR1` — restart is driven by `precmd` against a staged
+pending file (§5).
 
 ### 1.3 Installation snippets (for README)
 
@@ -233,7 +233,7 @@ careful atomic-rename gymnastics. File-per-job is the right call.
 | Field         | Source                            | Notes                                                     |
 |---------------|-----------------------------------|-----------------------------------------------------------|
 | `entry_id`    | `printf '%x-%x' $$ $HISTCMD`      | Filename and CLI handle. Unique by construction.          |
-| `shell_pid`   | `$$`                              | The zsh process the user typed into; receives `SIGUSR1`.  |
+| `shell_pid`   | `$$`                              | The zsh process the user typed into; names the pending file. |
 | `shell_tty`   | `$TTY`                            | e.g. `/dev/ttys003`. Cosmetic, for `list` output.         |
 | `child_pid`   | watcher: `pgrep -g <tpgid>` head  | The foreground child; for pipelines, the first stage.     |
 | `child_pgid`  | tpgid at capture                  | The foreground process group; used by `kill -PGID`.       |
@@ -253,8 +253,9 @@ monotonic per shell) and stays compact — typical IDs are 6–8 characters
 (e.g. `1319a-8e`).
 
 **Why so little.** The same-shell restart guarantee (§1) means the
-`TRAPUSR1` handler runs inside the original zsh process and inherits its
-live environment. Anything the shell already knows about itself
+restart eval runs inside the original zsh process (from `_reap_precmd`,
+see §5.1) and inherits its live environment. Anything the shell
+already knows about itself
 (`$PATH`, `$NODE_ENV`, `$VIRTUAL_ENV`, …) does not need to be on disk. PID
 liveness is verified by `kill -0` at query time, which also catches
 across-reboot staleness because the post-reboot PID either doesn't exist
@@ -315,15 +316,22 @@ The headline feature.
 
 1. Read entry. If `shell_pid` is dead (`kill -0` fails): remove the entry
    and error out — the originating shell is gone, no fallback.
-2. Send `SIGUSR1` to `shell_pid` (not the pgrp — that would also hit the
-   child).
-3. Return. The original shell's `TRAPUSR1` does the rest (§5.1).
+2. Write `pending/<shell_pid>` (atomically via tmp+rename) containing
+   `command=…` and `cwd=…` — the data the originating shell needs to
+   re-execute.
+3. Kill the foreground child (TERM → 5s poll → KILL escalation). The
+   kill is what wakes the shell's `wait()`; without it the shell stays
+   blocked and `_reap_precmd` never runs.
+4. Return. The next time `_reap_precmd` fires in the originating shell,
+   it sees `pending/<shell_pid>` and performs the restart (§5.1).
 
 Flags:
 
-- `--wait` → block until the entry's `child_pid` field has been updated
-  by the watcher (i.e., the new child has been registered), with a
-  timeout. Lets agents observe restart completion before running tests.
+- `--wait` → block until a new entry from this shell has been registered
+  with a different `child_pid`, with a timeout. Lets agents observe
+  restart completion before running tests. Polls the jobs directory for
+  any entry whose filename starts with `printf '%x' $shell_pid`; the
+  entry id changes across a restart because `$HISTCMD` advances.
 
 ### 4.5 `zsh-reap forget <id>`
 
@@ -334,59 +342,67 @@ no longer wants the agent to see/restart a particular server.
 
 ## 5. Restart-in-original-shell protocol
 
-### 5.1 Alive-shell path (`SIGUSR1` trap)
+### 5.1 Alive-shell path (pending file + `precmd`)
 
 Sequence:
 
 ```
 [CLI side]
-kill -USR1 <shell_pid>
+write $STATE/pending/<shell_pid>  ← command=…, cwd=… (atomic tmp+rename)
+kill -TERM -<child_pgid>          ← wakes the shell's wait()
+(escalate to -KILL after 5s if needed)
     │
     ▼
-[Shell side: TRAPUSR1]
-USR1 interrupts wait() in zwaitjob; trap fires
-glob $STATE/jobs/$(printf '%x' $$)-*    # exactly one match — the fg job
-source entry                            # → cmd, cwd, child_pgid
-rm entry
-kill -TERM -<child_pgid>
-cd $cwd
-_reap_preexec "$cmd"                    # respawn watcher
-eval $cmd                               # new fg child; trap blocks here
-    │
-    ▼
-(when the new child eventually exits, trap returns; zsh's main loop sees
-the original wait() came back, precmd removes the entry the watcher wrote
-for the new run)
+[Shell side: _reap_precmd, fired by zsh after wait() returns]
+while [ -f pending/$$ ]:
+    read cmd, cwd; rm pending/$$
+    rm jobs/$(printf '%x' $$)-*       # clean the entry the watcher had
+    cd "$cwd"
+    _reap_preexec "$cmd"              # respawn watcher for the new run
+    eval -- "$cmd"                    # ← becomes the shell's new fg job
+rm jobs/$(printf '%x' $$)-*           # post-loop cleanup
 ```
 
 A few things make this work cleanly:
 
-- **The trap finds its own job by glob.** Filenames start with
-  `printf '%x' $$`, and a given shell has at most one foreground job at
-  any moment, so the glob matches exactly one entry. No pending file
-  needed.
-- **The trap runs while `zwaitjob` is still blocked.** Per the zsh
-  source, signal traps fire at safe points inside `zwaitjob`'s
-  `sigsuspend` — the trap can run before the original child is reaped.
-  Sending `SIGUSR1` first and letting the trap send `SIGTERM` to the
-  child makes the trap the single agent of change; no races.
-- **`eval $cmd` re-blocks the shell on the new child.** Function traps
-  run in their own scope but execute commands in the parent shell's
-  context, so the new foreground child becomes the shell's new job,
-  exactly as if the user had retyped the line.
+- **The CLI stages the command before signalling.** The on-disk
+  `pending/<shell_pid>` file is the contract between CLI and shell, not
+  the registry entry — which `_reap_precmd` itself deletes in its
+  normal cleanup branch. Staging in a separate path means precmd's
+  cleanup and the restart input can't race.
+- **Killing the child is the wake-up signal.** Until the foreground
+  child dies, the shell is blocked in `wait()` and no hook fires. The
+  CLI's `kill -TERM` does double duty: terminate the old job *and*
+  unblock the shell so `precmd` runs. No SIGUSR1 is involved.
+- **`eval -- "$cmd"` inside precmd re-blocks the shell on the new
+  child.** zsh runs precmd hooks before printing the next prompt, so
+  invoking `eval` from precmd is indistinguishable from the user typing
+  the command at that prompt — the new foreground child becomes the
+  shell's new job.
+- **The `while` loop absorbs back-to-back restarts.** If a second
+  `zsh-reap restart` is issued while the first restart's eval is still
+  running, the second kill wakes us up again; the loop checks for a
+  fresh `pending/$$` and chains into the next restart without
+  returning to the prompt.
 - **Auto-execute is the default and only behavior.** The whole point of
   this plugin is that an agent can restart without touching the user's
   terminal. A "stage the command in the line buffer for the user to
-  approve" path defeats that. The same-UID argument applies: anyone who
-  can `kill -USR1` your shell could already `kill <shell>; nohup bad-cmd
-  &` you, so accepting USR1 as "run this previously-tracked command"
-  doesn't widen the privilege boundary.
+  approve" path defeats that. Same-UID anyone who can write our
+  pending file could already `ptrace` the shell or write into its
+  history, so accepting the file as "run this previously-tracked
+  command" doesn't widen the privilege boundary.
 
-**Tradeoff: TRAPUSR1 vs. polling a file.** An alternative to signals is
-to have a `precmd` hook that checks for a pending-restart file every
-prompt. That works only when the shell is *at* a prompt — exactly the
-case we don't care about (when there's no job to restart). It also costs
-a `stat` on every prompt. Signals are the right primitive here.
+**Tradeoff: `precmd` vs. `TRAPUSR1`.** An earlier draft of this design
+used `TRAPUSR1` so the restart could fire the instant the signal
+arrived. Two zsh realities killed it: (1) function-form traps are
+deferred to safe points between commands — they do *not* fire inside
+`zwaitjob`'s `sigsuspend`, so the trap can't kill the child to unblock
+itself; (2) once the trap is running its `eval`, a subsequent `SIGUSR1`
+arriving during that eval is unreliably (re-)delivered, so back-to-back
+restarts can silently drop the second one. `precmd` is plain control
+flow with no signal-timing surprises — it fires every time the shell
+returns from `wait()`. The cost is a single `[[ -f pending/$$ ]]` per
+prompt, which is negligible.
 
 ### 5.2 What happens when the shell is gone
 
@@ -397,11 +413,14 @@ manually. Detach mode is explicitly out of scope (see §1).
 If the shell crashes (no `zshexit` hook fires), lazy GC catches it on the
 next `list`/`restart` invocation by `kill -0`-ing `shell_pid`.
 
-### 5.3 Auth: who can signal the shell?
+### 5.3 Auth: who can stage a restart?
 
-`SIGUSR1` requires same-UID. Anyone who can already signal the user's
-shell can already `exec` arbitrary code as that user, so we don't widen
-the privilege boundary by accepting USR1. Detail in §6.
+The pending file lives in `$STATE/pending/`, which is mode `0700`
+under a `0700` parent. Only the owning UID can write into it. Anyone
+who can already write there can already `ptrace` the shell or scribble
+into `~/.zsh_history`, so honoring a same-UID pending file as "run
+this previously-tracked command" doesn't widen the privilege boundary.
+Detail in §6.
 
 ---
 
@@ -446,13 +465,14 @@ about:
    alternatives (env files, secret managers, stdin). Users who need
    stronger guarantees should not put secrets on the command line in
    the first place.
-3. **Registry-entry injection**: the `TRAPUSR1` handler reads an entry
-   from `$STATE/jobs/` and `eval`s its `command` field. If a same-UID
-   process could write a hostile entry whose filename matches
-   `printf '%x' $$`-prefix, the shell would obey on the next
-   `SIGUSR1`. The only mitigation is `$STATE` being mode `0700`, which
-   is enforced at plugin init. Same-UID attackers can already `eval` in
-   the shell directly (§6.2), so this is not an escalation.
+3. **Registry/pending-file injection**: `_reap_precmd` reads
+   `$STATE/pending/<shell_pid>` and `eval`s its `command` field. If a
+   same-UID process could write a hostile pending file (or, less
+   directly, a hostile registry entry that becomes the input to a
+   subsequent restart), the shell would obey on its next prompt. The
+   only mitigation is `$STATE` being mode `0700`, which is enforced at
+   plugin init. Same-UID attackers can already `eval` in the shell
+   directly (§6.2), so this is not an escalation.
 4. **CLI as setuid**: the CLI must never be installed setuid. We
    document this and refuse to run as root unless `ZSH_REAP_ALLOW_ROOT=1`
    is set (which we don't recommend).
