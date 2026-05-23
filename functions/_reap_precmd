@@ -15,9 +15,14 @@ local prefix
 prefix=$(printf '%x' $$)
 local state=${REAP[STATE_DIR]}
 local pending=$state/pending/$$
+# Hoist loop-body locals to function scope. Re-declaring a bare local
+# whose name already exists in this scope makes zsh's typeset-display
+# behaviour fire — it would echo `key=…`/`cmd=…` to the terminal on
+# back-to-back restarts.
+local key value cmd_q cwd_q cmd cwd
 
 while [[ -f $pending ]]; do
-  local key value cmd_q="" cwd_q=""
+  cmd_q=""; cwd_q=""
   while IFS='=' read -r key value; do
     case $key in
       command) cmd_q=$value ;;
@@ -26,7 +31,6 @@ while [[ -f $pending ]]; do
   done < "$pending"
   rm -f "$pending"
 
-  local cmd cwd
   eval "cmd=$cmd_q"
   eval "cwd=$cwd_q"
   [[ -z $cmd ]] && continue

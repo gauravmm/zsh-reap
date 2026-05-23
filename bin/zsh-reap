@@ -74,10 +74,13 @@ format_uptime() {
 
 cmd_list() {
   printf 'ID\tPID\tSHELL\tCWD\tUPTIME\tCOMMAND\n'
-  local f
+  # Declare loop-body locals once at function scope. A bare `local NAME`
+  # that hits an existing local at the same scope *prints* its current
+  # value as `name=value` (zsh's typeset-display behaviour), which used
+  # to leak between iteration N's row and iteration N+1's row.
+  local f id pid tty cwd start cmd uptime
   for f in "$JOBS_DIR"/*(N); do
     gc_one "$f" || continue
-    local id pid tty cwd start cmd uptime
     id=$(read_field "$f" entry_id)
     pid=$(read_field "$f" child_pid)
     tty=$(read_field "$f" shell_tty)
