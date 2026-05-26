@@ -173,7 +173,9 @@ and the command string on stdin. It:
    pipelines, all children share `tpgid`; we record the pgid as the
    primary identifier and the first child as `child_pid`.)
 5. Verifies the candidate child is at least as old as the watcher
-   (`ps -o etimes= -p $child_pid` ≳ `EPOCHSECONDS - start_epoch`). If
+   (`ps -o etime= -p $child_pid`, parsed `[[dd-]hh:]mm:ss` → seconds,
+   ≳ `EPOCHSECONDS - start_epoch`). `etime` is used rather than Linux's
+   `etimes` because BSD `ps` on macOS lacks the latter. If
    the child is significantly younger, the original command finished
    during our sleep and a new one took its place; writing would
    produce a stale-command / current-pid Frankenstein entry. Bail
